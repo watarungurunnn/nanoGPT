@@ -26,6 +26,37 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class SparseCausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.key = nn.Linear(config.n_embd, config.n_embd)
+        self.query = nn.Linear(config.n_embd, config.n_embd)
+        self.value = nn.Linear(config.n_embd, config.n_embd)
+        self.n_head = config.n_head
+        self.window_size = 256  # You can adjust the window size here
+
+    def forward(self, x):
+        B, T, C = x.size()
+        head_dim = C // self.n_head
+
+        k = self.key(x).view(B, T, self.n_head, head_dim)
+        q = self.query(x).view(B, T, self.n_head, head_dim)
+        v = self.value(x).view(B, T, self.n_head, head_dim)
+
+        # Each token attends within a local window
+        y = torch.zeros_like(x)
+        for i in range(T):
+            start = max(0, i - self.window_size)
+            end = i + 1  # Local window: from i-window_size to i
+            weights = torch.einsum('bhdi,bhdj->bhij', q[:, i:i+1, :, :], k[:, start:end, :, :])
+            weights = torch.nn.functional.softmax(weights, dim=-1)  # Apply softmax to normalize the weights
+
+            # Local context-aware weighted sum
+            y[:, i:i+1, :] = torch.einsum('bhij,bhdj->bhdi', weights, v[:, start:end, :, :])
+
+        return y.contiguous()
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -96,14 +127,68 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        if config.attn_type == 'sparse':
+            self.attn = SparseCausalSelfAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.use_moe = config.use_moe
+        if self.use_moe:
+            self.ff = MoE(config)
+        else:
+            self.ff = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        if self.use_moe:
+            x_out, aux_loss = self.ff(self.ln_2(x))
+            x = x + x_out
+        else:
+            x_out = self.ff(self.ln_2(x))
+            x = x + x_out
+            aux_loss = None
+        return x, aux_loss
+
+class MoE(nn.Module):
+    def __init__(
+        self,
+        config,
+    ):
+        super().__init__()
+        self.experts = nn.ModuleList([MLP(config)
+                                     for i in range(config.num_experts)])
+        self.gate = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+
+    def forward(self, x):
+        orig_shape = x.shape
+        num_experts = self.num_experts
+        x = x.view(-1, x.shape[-1])
+
+        scores = self.gate(x)
+        expert_weights, expert_indices = torch.topk(
+            scores, self.num_experts_per_tok, dim=-1)
+        expert_weights = expert_weights.softmax(dim=-1)
+        flat_expert_indices = expert_indices.view(-1)
+
+        x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+        y = torch.empty_like(x, dtype=torch.bfloat16, device=x.device)
+        for i, expert in enumerate(self.experts):
+            mask = flat_expert_indices == i
+            y[mask] = expert(x[mask])
+        y = (y.view(*expert_weights.shape, -1) *
+             expert_weights.unsqueeze(-1)).sum(dim=1)
+
+        # calcurate auxiliary loss
+        expert_mask = torch.nn.functional.one_hot(expert_indices, num_experts)
+        expert_mask = torch.max(expert_mask, axis=-2).values.to(torch.bfloat16)
+        tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
+        router_prob_per_group_and_expert = torch.mean(expert_weights, axis=-1)
+
+        # for ease, alpha is set to 1/(num_experts ** 2) here.
+        aux_loss = torch.mean(tokens_per_group_and_expert * router_prob_per_group_and_expert.unsqueeze(-1))
+        return y.view(*orig_shape), aux_loss
 
 @dataclass
 class GPTConfig:
@@ -114,7 +199,12 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
+    use_moe: bool = False
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    aux_loss_alpha: float = 1.0
+    attn_type: str = ""
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -177,16 +267,19 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        total_aux_loss = 0
         for block in self.transformer.h:
-            x = block(x)
+            x, aux_loss = block(x)
+            total_aux_loss += (aux_loss or 0)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            log_probs = F.log_softmax(logits, dim=-1)
-            targets_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
-            loss = -(log_probs * targets_one_hot).sum(dim=-1).mean() / torch.log(torch.tensor(2.0))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) / torch.log(torch.tensor(2.0))
+            if self.training:
+                #print('aux loss', total_aux_loss)
+                loss += self.config.aux_loss_alpha * total_aux_loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
