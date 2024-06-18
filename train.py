@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-
+from collections import defaultdict
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -57,7 +57,12 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 use_moe = False
 num_experts = 4
 num_experts_per_tok = 2
+<<<<<<< HEAD
 aux_loss_alpha = 1.0
+=======
+load_loss_alpha = 1.0
+load_var_loss_alpha = 0.0
+>>>>>>> 67ecbe809d7679e2a4a075a9969dcad5ae6cd9ab
 attn_type: str = ""
 multi_expert = False
 # adamw optimizer
@@ -148,10 +153,19 @@ if os.path.exists(meta_path):
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    stoi, itos = meta['stoi'], meta['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+<<<<<<< HEAD
                   bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok) # start with model_args from command line
+=======
+                  bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, 
+                  num_experts_per_tok=num_experts_per_tok, multi_expert=multi_expert,
+                  load_var_loss_alpha=load_var_loss_alpha) # start with model_args from command line
+>>>>>>> 67ecbe809d7679e2a4a075a9969dcad5ae6cd9ab
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -221,17 +235,23 @@ if ddp:
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    out_metrics = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        wandb_metrics = defaultdict(lambda: torch.zeros(eval_iters))
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, wandb_metric = model(X, Y)
             losses[k] = loss.item()
+            for key, value in wandb_metric.items():
+                wandb_metrics[key][k] = value
         out[split] = losses.mean()
+        for key, value in wandb_metrics.items():
+            out_metrics[f'{split}/{key}'] = value.mean()
     model.train()
-    return out
+    return out, out_metrics
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -267,7 +287,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses, wandb_metrics = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -276,6 +296,7 @@ while True:
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
+                **wandb_metrics,
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -303,7 +324,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, _ = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

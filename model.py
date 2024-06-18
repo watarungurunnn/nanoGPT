@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from collections import defaultdict
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -141,54 +142,102 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         if self.use_moe:
-            x_out, aux_loss = self.ff(self.ln_2(x))
+            x_out, load_loss = self.ff(self.ln_2(x))
             x = x + x_out
         else:
             x_out = self.ff(self.ln_2(x))
             x = x + x_out
-            aux_loss = None
-        return x, aux_loss
+            load_loss = None
+        return x, load_loss
 
-class MoE(nn.Module):
-    def __init__(
-        self,
-        config,
-    ):
+class TransformerLayer(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.experts = nn.ModuleList([MLP(config)
-                                     for i in range(config.num_experts)])
-        self.gate = nn.Linear(config.n_embd, config.num_experts, bias=False)
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.num_experts = config.num_experts
+        self.self_attn = nn.MultiheadAttention(embed_dim=config.n_embd, num_heads=config.n_head, dropout=config.dropout)
+        self.linear1 = nn.Linear(config.n_embd, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.n_embd, config.n_embd)
+        self.norm1 = nn.LayerNorm(config.n_embd)
+        self.norm2 = nn.LayerNorm(config.n_embd)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+        self.activation = nn.GELU()
 
     def forward(self, x):
-        orig_shape = x.shape
-        num_experts = self.num_experts
-        x = x.view(-1, x.shape[-1])
+        x2 = self.norm1(x)
+        x = x + self.dropout1(self.self_attn(x2, x2, x2)[0])
+        x2 = self.norm2(x)
+        x2 = self.linear1(x2)
+        x2 = self.activation(x2)
+        x2 = self.dropout(x2)
+        x2 = self.linear2(x2)
+        x = x + self.dropout2(x2)
+        return x
 
-        scores = self.gate(x)
-        expert_weights, expert_indices = torch.topk(
-            scores, self.num_experts_per_tok, dim=-1)
-        expert_weights = expert_weights.softmax(dim=-1)
-        flat_expert_indices = expert_indices.view(-1)
+class ConvLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=3, padding=1)
+        self.activation = nn.GELU()
+        self.norm = nn.LayerNorm(config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
 
-        x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
-        y = torch.empty_like(x, dtype=torch.bfloat16, device=x.device)
-        for i, expert in enumerate(self.experts):
-            mask = flat_expert_indices == i
-            y[mask] = expert(x[mask])
-        y = (y.view(*expert_weights.shape, -1) *
-             expert_weights.unsqueeze(-1)).sum(dim=1)
+    def forward(self, x):
+        print(x.shape)
+        x = x.transpose(1, 2)  # Switch from (B, T, C) to (B, C, T) for Conv1d
+        x = self.conv1(x)
+        x = self.activation(x)
+        x = self.conv2(x)
+        x = x.transpose(1, 2)  # Switch back to (B, T, C)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
 
-        # calcurate auxiliary loss
-        expert_mask = torch.nn.functional.one_hot(expert_indices, num_experts)
-        expert_mask = torch.max(expert_mask, axis=-2).values.to(torch.bfloat16)
-        tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
-        router_prob_per_group_and_expert = torch.mean(expert_weights, axis=-1)
+class RecurrentLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.rnn = nn.GRU(input_size=config.n_embd, hidden_size=config.n_embd, num_layers=1, batch_first=True, dropout=config.dropout)
+        self.norm = nn.LayerNorm(config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
 
-        # for ease, alpha is set to 1/(num_experts ** 2) here.
-        aux_loss = torch.mean(tokens_per_group_and_expert * router_prob_per_group_and_expert.unsqueeze(-1))
-        return y.view(*orig_shape), aux_loss
+    def forward(self, x):
+        x, _ = self.rnn(x)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.load_var_loss_alpha = config.load_var_loss_alpha
+        self.num_experts = config.num_experts
+        if config.multi_expert:
+            self.experts = nn.ModuleList([])
+            for _ in range(self.num_experts // 2):
+                self.experts.extend([MLP(config), CausalSelfAttention(config)])
+        else:
+            self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
+        self.gate = nn.Linear(config.n_embd, self.num_experts)
+
+    def forward(self, x):
+        # Softmax gating provides a probability distribution over experts
+        gating_scores = self.gate(x)
+        gating_distribution = F.softmax(gating_scores, dim=-1).permute(0, 2, 1) # [batch_size, num_experts, seq_length]
+
+        # Mix the outputs of experts based on gating distribution
+        # TODO: parrarelize the forward process 
+        expert_outputs = [expert(x) for expert in self.experts]
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, seq_length, dim]
+
+        # Weighted sum of expert outputs
+        mixed_expert_outputs = (expert_outputs * gating_distribution.unsqueeze(-1)).sum(dim=1)
+
+        # Calculate load balancing loss (auxiliary loss)
+        load_token_var = gating_distribution.var()
+        load = gating_distribution.mean((0, -1))  # Mean across batch dimension
+        load_loss = (load * torch.log(load + 1e-9)).sum() / torch.log(torch.tensor(load.shape[0])) + 1  # Entropy-based load balancing loss
+        return mixed_expert_outputs, {'load_loss': load_loss, 'load_var_loss': -load_token_var}
 
 @dataclass
 class GPTConfig:
@@ -202,8 +251,10 @@ class GPTConfig:
     use_moe: bool = False
     num_experts: int = 8
     num_experts_per_tok: int = 2
-    aux_loss_alpha: float = 1.0
+    load_loss_alpha: float = 1.0
+    load_var_loss_alpha: float = 0.0
     attn_type: str = ""
+    multi_expert: bool = False
     
 class GPT(nn.Module):
 
@@ -267,25 +318,27 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        total_aux_loss = 0
+        total_load_loss = {}
         for block in self.transformer.h:
-            x, aux_loss = block(x)
-            total_aux_loss += (aux_loss or 0)
+            x, load_loss = block(x)
+            for k in load_loss:
+                total_load_loss[k] = total_load_loss.get(k, 0) + load_loss[k]
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) / torch.log(torch.tensor(2.0))
+            # logits: [batch, seq_len, vocab_size]
+            # targets: [batch, seq_len]
+            loss = F.cross_entropy(logits.permute(0, 2, 1), targets, reduction='mean') / torch.log(torch.tensor(2.0))
             if self.training:
-                #print('aux loss', total_aux_loss)
-                loss += self.config.aux_loss_alpha * total_aux_loss
+                loss += self.config.load_loss_alpha * total_load_loss['load_loss'] 
+                loss += self.config.load_var_loss_alpha * total_load_loss['load_var_loss']
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, total_load_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
