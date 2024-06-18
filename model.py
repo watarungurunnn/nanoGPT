@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from collections import defaultdict
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -98,12 +99,111 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.use_moe = config.use_moe
+        if self.use_moe:
+            self.ff = MoE(config)
+        else:
+            self.ff = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.use_moe:
+            x_out, load_loss = self.ff(self.ln_2(x))
+            x = x + x_out
+        else:
+            x_out = self.ff(self.ln_2(x))
+            x = x + x_out
+            load_loss = None
+        return x, load_loss
+
+class TransformerLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(embed_dim=config.n_embd, num_heads=config.n_head, dropout=config.dropout)
+        self.linear1 = nn.Linear(config.n_embd, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.n_embd, config.n_embd)
+        self.norm1 = nn.LayerNorm(config.n_embd)
+        self.norm2 = nn.LayerNorm(config.n_embd)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        x2 = self.norm1(x)
+        x = x + self.dropout1(self.self_attn(x2, x2, x2)[0])
+        x2 = self.norm2(x)
+        x2 = self.linear1(x2)
+        x2 = self.activation(x2)
+        x2 = self.dropout(x2)
+        x2 = self.linear2(x2)
+        x = x + self.dropout2(x2)
         return x
+
+class ConvLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=config.n_embd, out_channels=config.n_embd, kernel_size=3, padding=1)
+        self.activation = nn.GELU()
+        self.norm = nn.LayerNorm(config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        print(x.shape)
+        x = x.transpose(1, 2)  # Switch from (B, T, C) to (B, C, T) for Conv1d
+        x = self.conv1(x)
+        x = self.activation(x)
+        x = self.conv2(x)
+        x = x.transpose(1, 2)  # Switch back to (B, T, C)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
+
+class RecurrentLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.rnn = nn.GRU(input_size=config.n_embd, hidden_size=config.n_embd, num_layers=1, batch_first=True, dropout=config.dropout)
+        self.norm = nn.LayerNorm(config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x, _ = self.rnn(x)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.load_var_loss_alpha = config.load_var_loss_alpha
+        self.num_experts = config.num_experts
+        if config.multi_expert:
+            self.experts = nn.ModuleList([])
+            for _ in range(self.num_experts // 2):
+                self.experts.extend([MLP(config), CausalSelfAttention(config)])
+        else:
+            self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
+        self.gate = nn.Linear(config.n_embd, self.num_experts)
+
+    def forward(self, x):
+        # Softmax gating provides a probability distribution over experts
+        gating_scores = self.gate(x)
+        gating_distribution = F.softmax(gating_scores, dim=-1).permute(0, 2, 1) # [batch_size, num_experts, seq_length]
+
+        # Mix the outputs of experts based on gating distribution
+        # TODO: parrarelize the forward process 
+        expert_outputs = [expert(x) for expert in self.experts]
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, seq_length, dim]
+
+        # Weighted sum of expert outputs
+        mixed_expert_outputs = (expert_outputs * gating_distribution.unsqueeze(-1)).sum(dim=1)
+
+        # Calculate load balancing loss (auxiliary loss)
+        load_token_var = gating_distribution.var()
+        load = gating_distribution.mean((0, -1))  # Mean across batch dimension
+        load_loss = (load * torch.log(load + 1e-9)).sum() / torch.log(torch.tensor(load.shape[0])) + 1  # Entropy-based load balancing loss
+        return mixed_expert_outputs, {'load_loss': load_loss, 'load_var_loss': -load_token_var}
 
 @dataclass
 class GPTConfig:
@@ -114,7 +214,14 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
+    use_moe: bool = False
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    load_loss_alpha: float = 1.0
+    load_var_loss_alpha: float = 0.0
+    attn_type: str = ""
+    multi_expert: bool = False
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -177,22 +284,36 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        total_load_loss = {}
         for block in self.transformer.h:
-            x = block(x)
+            x, load_loss = block(x)
+            for k in load_loss:
+                total_load_loss[k] = total_load_loss.get(k, 0) + load_loss[k]
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            log_probs = F.log_softmax(logits, dim=-1)
-            targets_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
-            loss = -(log_probs * targets_one_hot).sum(dim=-1).mean() / torch.log(torch.tensor(2.0))
+            # logits: [batch, seq_len, vocab_size]
+            # targets: [batch, seq_len]
+            #log_probs = F.softmax(logits, dim=-1)
+            # for i in range(1, 11):
+            #     target = targets[0][-i]
+            #     print(log_probs[0][-i][target])
+            #     print(target, log_probs[0][-i].argmax())
+            #log_probs_max = log_probs.argmax(dim=-1)
+            # print(log_probs_max[0][:10])
+            # #print(log_probs.sum(dim=-1))
+            # print(log_probs.median(dim=-1).values)
+            loss = F.cross_entropy(logits.permute(0, 2, 1), targets, reduction='mean') / torch.log(torch.tensor(2.0))
+            if self.training:
+                loss += self.config.load_loss_alpha * total_load_loss['load_loss'] 
+                loss += self.config.load_var_loss_alpha * total_load_loss['load_var_loss']
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, total_load_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
