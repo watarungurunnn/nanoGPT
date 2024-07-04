@@ -27,6 +27,37 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class SparseCausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.key = nn.Linear(config.n_embd, config.n_embd)
+        self.query = nn.Linear(config.n_embd, config.n_embd)
+        self.value = nn.Linear(config.n_embd, config.n_embd)
+        self.n_head = config.n_head
+        self.window_size = 256  # You can adjust the window size here
+
+    def forward(self, x):
+        B, T, C = x.size()
+        head_dim = C // self.n_head
+
+        k = self.key(x).view(B, T, self.n_head, head_dim)
+        q = self.query(x).view(B, T, self.n_head, head_dim)
+        v = self.value(x).view(B, T, self.n_head, head_dim)
+
+        # Each token attends within a local window
+        y = torch.zeros_like(x)
+        for i in range(T):
+            start = max(0, i - self.window_size)
+            end = i + 1  # Local window: from i-window_size to i
+            weights = torch.einsum('bhdi,bhdj->bhij', q[:, i:i+1, :, :], k[:, start:end, :, :])
+            weights = torch.nn.functional.softmax(weights, dim=-1)  # Apply softmax to normalize the weights
+
+            # Local context-aware weighted sum
+            y[:, i:i+1, :] = torch.einsum('bhij,bhdj->bhdi', weights, v[:, start:end, :, :])
+
+        return y.contiguous()
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -97,7 +128,10 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        if config.attn_type == 'sparse':
+            self.attn = SparseCausalSelfAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.use_moe = config.use_moe
         self.linear_type = config.linear_type
@@ -301,15 +335,6 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             # logits: [batch, seq_len, vocab_size]
             # targets: [batch, seq_len]
-            #log_probs = F.softmax(logits, dim=-1)
-            # for i in range(1, 11):
-            #     target = targets[0][-i]
-            #     print(log_probs[0][-i][target])
-            #     print(target, log_probs[0][-i].argmax())
-            #log_probs_max = log_probs.argmax(dim=-1)
-            # print(log_probs_max[0][:10])
-            # #print(log_probs.sum(dim=-1))
-            # print(log_probs.median(dim=-1).values)
             loss = F.cross_entropy(logits.permute(0, 2, 1), targets, reduction='mean') / torch.log(torch.tensor(2.0))
             if self.training:
                 loss += self.config.load_loss_alpha * total_load_loss['load_loss'] 

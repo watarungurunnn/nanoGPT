@@ -58,8 +58,12 @@ use_moe = False
 linear_type = 'mlp' # this can be set to kan.
 num_experts = 4
 num_experts_per_tok = 2
+<<<<<<< HEAD
+aux_loss_alpha = 1.0
+=======
 load_loss_alpha = 1.0
 load_var_loss_alpha = 0.0
+>>>>>>> 67ecbe809d7679e2a4a075a9969dcad5ae6cd9ab
 attn_type: str = ""
 multi_expert = False
 # adamw optimizer
@@ -156,9 +160,13 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+<<<<<<< HEAD
+                  bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok) # start with model_args from command line
+=======
                   bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, 
                   num_experts_per_tok=num_experts_per_tok, multi_expert=multi_expert, linear_type=linear_type,
                   load_var_loss_alpha=load_var_loss_alpha) # start with model_args from command line
+>>>>>>> 67ecbe809d7679e2a4a075a9969dcad5ae6cd9ab
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")

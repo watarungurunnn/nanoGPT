@@ -1,7 +1,7 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-enwik8-char_2M'
+out_dir = 'out-enwik8-char_2M_mid'
 eval_interval = 1000 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -13,7 +13,7 @@ always_save_checkpoint = False
 
 wandb_log = True # override via command line if you like
 wandb_project = 'enwik8_char'
-wandb_run_name = 'nanoGPT'
+wandb_run_name = 'nanoGPT_mid'
 
 dataset = 'enwik8_char'
 batch_size = 16
@@ -22,8 +22,8 @@ gradient_accumulation_steps = 1
 #learning_rate = 6e-5 # max learning rate
 min_lr = 1e-9
 # baby GPT model :)
-n_layer = 12
-n_head = 12
+n_layer = 24
+n_head = 24
 n_embd = 384
 dropout = 0.2
 
