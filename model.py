@@ -100,8 +100,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.use_moe = config.use_moe
+        self.linear_type = config.linear_type
         if self.use_moe:
             self.ff = MoE(config)
+        elif self.linear_type.lower() == 'kan':
+            self.ff = KAN(config)
         else:
             self.ff = MLP(config)
 
@@ -182,6 +185,8 @@ class MoE(nn.Module):
             self.experts = nn.ModuleList([])
             for _ in range(self.num_experts // 2):
                 self.experts.extend([MLP(config), CausalSelfAttention(config)])
+        elif config.linear_type == 'kan':
+            self.experts = nn.ModuleList([KAN(config) for _ in range(self.num_experts)])
         else:
             self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         self.gate = nn.Linear(config.n_embd, self.num_experts)
@@ -215,6 +220,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_moe: bool = False
+    linear_type: str = None
     num_experts: int = 8
     num_experts_per_tok: int = 2
     load_loss_alpha: float = 1.0

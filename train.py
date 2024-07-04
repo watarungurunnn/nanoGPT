@@ -55,6 +55,7 @@ n_embd = 512
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 use_moe = False
+linear_type = 'mlp' # this can be set to kan.
 num_experts = 4
 num_experts_per_tok = 2
 load_loss_alpha = 1.0
@@ -156,7 +157,7 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, 
-                  num_experts_per_tok=num_experts_per_tok, multi_expert=multi_expert,
+                  num_experts_per_tok=num_experts_per_tok, multi_expert=multi_expert, linear_type=linear_type,
                   load_var_loss_alpha=load_var_loss_alpha) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -288,6 +289,7 @@ while True:
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
+                'step': iter_num,
                 **wandb_metrics,
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
