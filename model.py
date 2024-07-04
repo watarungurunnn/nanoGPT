@@ -153,6 +153,80 @@ class Block(nn.Module):
             load_loss = None
         return x, load_loss
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class KAN(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # MLPと同じように設定パラメータを使用
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.bias = config.bias
+
+        # KANの設定
+        self.layers_hidden = [config.n_embd, 4 * config.n_embd, config.n_embd]
+        self.grid_size = 5
+        self.spline_order = 3
+        self.base_activation = nn.GELU()
+        self.grid_range = [-1, 1]
+
+        # KANの初期化
+        self.base_weights = nn.ParameterList()
+        self.spline_weights = nn.ParameterList()
+        self.layer_norms = nn.ModuleList()
+        self.prelus = nn.ModuleList()
+        self.grids = []
+
+        for i, (in_features, out_features) in enumerate(zip(self.layers_hidden, self.layers_hidden[1:])):
+            self.base_weights.append(nn.Parameter(torch.randn(out_features, in_features)))
+            self.spline_weights.append(nn.Parameter(torch.randn(out_features, in_features, self.grid_size + self.spline_order)))
+            self.layer_norms.append(nn.LayerNorm(out_features))
+            self.prelus.append(nn.PReLU())
+
+            h = (self.grid_range[1] - self.grid_range[0]) / self.grid_size
+            grid = torch.linspace(
+                self.grid_range[0] - h * self.spline_order,
+                self.grid_range[1] + h * self.spline_order,
+                self.grid_size + 2 * self.spline_order + 1,
+                dtype=torch.float32
+            ).expand(in_features, -1).contiguous()
+            self.register_buffer(f'grid_{i}', grid)
+            self.grids.append(grid)
+
+        for weight in self.base_weights:
+            nn.init.kaiming_uniform_(weight, nonlinearity='linear')
+        for weight in self.spline_weights:
+            nn.init.kaiming_uniform_(weight, nonlinearity='linear')
+
+        # MLPと同様のドロップアウト層
+        self.dropout = nn.Dropout(self.dropout)
+
+    def forward(self, x):
+        for i, (base_weight, spline_weight, layer_norm, prelu) in enumerate(zip(self.base_weights, self.spline_weights, self.layer_norms, self.prelus)):
+            grid = self._buffers[f'grid_{i}']
+            x = x.to(base_weight.device)
+
+            base_output = F.linear(self.base_activation(x), base_weight)
+            x_uns = x.unsqueeze(-1)
+            bases = ((x_uns >= grid[:, :-1]) & (x_uns < grid[:, 1:])).to(x.dtype)
+
+            for k in range(1, self.spline_order + 1):
+                left_intervals = grid[:, :-(k + 1)]
+                right_intervals = grid[:, k:-1]
+                delta = torch.where(right_intervals == left_intervals, torch.ones_like(right_intervals), right_intervals - left_intervals)
+                bases = ((x_uns - left_intervals) / delta * bases[:, :, :-1]) + \
+                        ((grid[:, k + 1:] - x_uns) / (grid[:, k + 1:] - grid[:, 1:(-k)]) * bases[:, :, 1:])
+            bases = bases.contiguous()
+
+            spline_output = F.linear(bases.view(x.size(0), -1), spline_weight.view(spline_weight.size(0), -1))
+            x = prelu(layer_norm(base_output + spline_output))
+
+        # MLPと同様にドロップアウトを適用
+        x = self.dropout(x)
+        return x
+        
 class TransformerLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
